@@ -22,7 +22,6 @@ import hmac
 import json
 import os
 import re
-
 import yum
 import yum.config
 import yum.Errors
@@ -49,6 +48,7 @@ BUFFER_SIZE = 1024 * 1024
 OPTIONAL_ATTRIBUTES = ['priority', 'base_persistdir', 'metadata_expire',
                        'skip_if_unavailable', 'keepcache', 'priority']
 UNSUPPORTED_ATTRIBUTES = ['mirrorlist']
+
 
 
 def config_hook(conduit):
@@ -97,17 +97,22 @@ def parse_url(url):
 
 
 def replace_repo(repos, repo):
+    print "replace_repo"
     repos.delete(repo.id)
     repos.add(S3Repository(repo.id, repo))
+    print "repos: %s" % repos
 
 
 def prereposetup_hook(conduit):
     """Plugin initialization hook. Setup the S3 repositories."""
 
+    conduit.info(2,"pereposetup_hook")
     if 'DISABLE_YUM_S3_IAM' in os.environ and os.environ['DISABLE_YUM_S3_IAM']:
         return
 
+    conduit.info(2,"preparing to get repos")
     repos = conduit.getRepos()
+    conduit.info(2, "repos: %s" % (repos))
     for repo in repos.listEnabled():
         url = repo.baseurl
         if(isinstance(url, list)):
@@ -128,6 +133,7 @@ class S3Repository(YumRepository):
 
         bucket, region, path = parse_url(repo.baseurl)
 
+        print("parse path: %s, %s, %s" % (path, region, bucket));
         if bucket is None:
             msg = "s3iam: unable to parse url %s'" % repo.baseurl
             raise yum.plugins.PluginYumExit(msg)
@@ -139,8 +145,10 @@ class S3Repository(YumRepository):
         else:
             self.baseurl = "https://%s.s3.amazonaws.com%s" % (bucket, path)
 
+
         self.name = repo.name
         self.region = repo.region if repo.region else region
+        print("self.region: %s" % (self.region))
         self.basecachedir = repo.basecachedir
         self.gpgcheck = repo.gpgcheck
         self.gpgkey = repo.gpgkey
@@ -227,6 +235,7 @@ class S3Grabber(object):
         self.token = None
 
     def get_role(self):
+        print("get_role called")
         """Read IAM role from AWS metadata store."""
         request = urllib2.Request(
             urlparse.urljoin(
@@ -237,6 +246,7 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             self.iamrole = (response.read())
+            print("response iamrole = %s" % self.iamrole)
         except Exception:
             response = None
             self.iamrole = ""
@@ -245,6 +255,7 @@ class S3Grabber(object):
                 response.close()
 
     def get_credentials(self):
+        print("get_credentials");
         """Read IAM credentials from AWS metadata store.
         Note: This method should be explicitly called after constructing new
               object, as in 'explicit is better than implicit'.
@@ -257,12 +268,15 @@ class S3Grabber(object):
                 ), self.iamrole))
 
         try:
+            print("Opening url... %s" % (request))
             response = urllib2.urlopen(request)
             data = json.loads(response.read())
+            print("response urllib2: %s" % (data))
             self.access_key = data['AccessKeyId']
             self.secret_key = data['SecretAccessKey']
             self.token = data['Token']
         except Exception:
+            print("error in library")
             response = None
         finally:
             if response:
@@ -286,11 +300,13 @@ class S3Grabber(object):
             raise URLGrabError(7, msg)
 
     def set_credentials(self, access_key, secret_key):
+        print("set_credentials - %s %s" % (access_key, secret_key))
         self.access_key = access_key
         self.secret_key = secret_key
         self.token = None
 
     def get_delegated_role_credentials(self, delegated_role):
+        print("get_delegated_role_credentials %s " % (delegated_role))
         """Collect temporary credentials from AWS STS service. Uses
         delegated_role value from configuration.
         Note: This method should be explicitly called after constructing new
@@ -306,6 +322,7 @@ class S3Grabber(object):
         self.token = assumed_role.credentials.session_token
 
     def get_instance_region(self):
+        print("get_instance_region()")
         """Read region from AWS metadata store."""
         request = urllib2.Request(
             urlparse.urljoin(
@@ -317,6 +334,7 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             data = response.read()
+            print("urlopen response %s" + data)
         finally:
             if response:
                 response.close()
@@ -324,6 +342,7 @@ class S3Grabber(object):
 
     def _request(self, path, timeval=None):
         url = urlparse.urljoin(self.baseurl, urllib2.quote(path))
+        print("_request called %s" % url)
         request = urllib2.Request(url)
         if self.region:
             self.signV4(request, timeval)
@@ -331,9 +350,19 @@ class S3Grabber(object):
             self.signV2(request, timeval)
         return request
 
+    def pretty_print_POST(self, req):
+        print('{}\n{}\n{}\n\n{}'.format(
+          '-----------START-----------',
+          req.get_method() + ' ' + req.get_full_url(),
+          '\n'.join('{}: {}'.format(k, v) for k, v in req.headers.items()),
+          'body',
+        ))
+
     def urlgrab(self, url, filename=None, **kwargs):
+        print("urlgrab starting %s" % (url))
         """urlgrab(url) copy the file to the local filesystem."""
         request = self._request(url)
+        self.pretty_print_POST(request)
         if filename is None:
             filename = request.get_selector()
             if filename.startswith('/'):
@@ -345,16 +374,22 @@ class S3Grabber(object):
         out = open(filename, 'w+')
         while retries > 0:
             try:
+                print("request to open %s:" % (request.get_full_url()))
+                print("request header %s:" % (request.header_items()))
                 response = urllib2.urlopen(request)
                 buff = response.read(BUFFER_SIZE)
                 while buff:
                     out.write(buff)
                     buff = response.read(BUFFER_SIZE)
             except urllib2.HTTPError, e:
+                print("error opening url %s %s %s" % (e, e.code, e.reason))
+                print("error headers %s" % (e.headers))
                 if retries > 0:
+                    print("retry...")
                     time.sleep(delay)
                     delay *= self.backoff
                 else:
+                    print("no more retries.  just give up");
                     # Wrap exception as URLGrabError so that YumRepository catches it
                     from urlgrabber.grabber import URLGrabError
                     msg = '%s on %s tried' % (e, url)
@@ -375,14 +410,17 @@ class S3Grabber(object):
         return filename
 
     def urlopen(self, url, **kwargs):
+        print("urlopen started with url %s" % (url) )
         """urlopen(url) open the remote file and return a file object."""
         return urllib2.urlopen(self._request(url))
 
     def urlread(self, url, limit=None, **kwargs):
+        print("urlread started")
         """urlread(url) return the contents of the file as a string."""
         return urllib2.urlopen(self._request(url)).read()
 
     def signV2(self, request, timeval=None):
+        print("signV2 started")
         """Attach a valid S3 signature to request.
         request - instance of Request
         """
